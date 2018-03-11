@@ -7,15 +7,24 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define SLASHSTR "/"
+#if defined(OS_WINDOWS)
+#include <windows.h>
+#include <direct.h>
+#define SLASHSTR "\\"
 
-//#define SLASHSTR "\\"
+#else
+#define SLASHSTR "/"
+#endif
 
 
 int verbose=0;
 
 typedef struct {
+#if defined(OS_WINDOWS)
+	WIN32_FILE_ATTRIBUTE_DATA s;
+#else
 	struct stat s;
+#endif
 } fileinfo_t;
 
 
@@ -53,6 +62,8 @@ int main(int argc, char **argv)
 	fileinfo_t srcinfo, destinfo, pchinfo, targetinfo;
 	fileinfo_t destArduinoinfo, srcArduinoinfo, depinfo, gchinfo, fileinfo;
 	int i, r, size;
+	char *arglist[200];
+	int argcount;
 	char *buffer;
 	const char *p;
 	FILE *fp;
@@ -210,18 +221,96 @@ int main(int argc, char **argv)
 
 compile:
 	printf_verbose("Running Compiler:\n");
-	char *arglist[200];
-	if (argc - first_compiler_arg + 2 > 200) die("Error: too many compiler args!\n");
+	if (argc - first_compiler_arg + 2 > sizeof(arglist)/sizeof(char *)) {
+		die("Error: too many compiler args!\n");
+	}
 	for (i = first_compiler_arg; i < argc; i++) {
 		arglist[i - first_compiler_arg] = argv[i];
 		printf_verbose("arg: %s\n", argv[i]);
 	}
-	arglist[i - first_compiler_arg] = NULL;
+	argcount = argc - first_compiler_arg;
 	printf_verbose("prog: %s\n", argv[first_compiler_arg]);
 	printf_verbose("\n********************************************\n");
 	fflush(stdout);
 	fflush(stderr);
+#if defined(OS_WINDOWS)
+	char line[32768];
+	int len;
+	len = snprintf(line, sizeof(line), "\"%s\"", arglist[0]);
+	for (i = 1; i < argcount; i++) {
+		if (strchr(arglist[i], ' ')) {
+			len += snprintf(line + len, sizeof(line) - len, " \"%s\"", arglist[i]);
+		} else {
+			len += snprintf(line + len, sizeof(line) - len, " %s", arglist[i]);
+		}
+	}
+	for (i = 0; i < len; i++) {
+		if (line[i] == '/') line[i] = '\\';
+	}
+	printf_verbose("command line: %s\n", line);
+	SECURITY_ATTRIBUTES sa;
+	sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+	sa.bInheritHandle = TRUE;
+	sa.lpSecurityDescriptor = NULL;
+	HANDLE h_rd=NULL, h_wr=NULL;
+	if (!CreatePipe(&h_rd, &h_wr, &sa, 0)) {
+		die("precompile_helper: CreatePipe fail\n");
+	}
+	if (!SetHandleInformation(h_rd, HANDLE_FLAG_INHERIT, 0)) {
+		die("precompile_helper: SetHandleInformation fail\n");
+	}
+	PROCESS_INFORMATION pi;
+	STARTUPINFO si;
+	memset(&pi, 0, sizeof(PROCESS_INFORMATION));
+	memset(&si, 0, sizeof(STARTUPINFO));
+	si.hStdError = h_wr;
+	si.hStdOutput = h_wr;
+	si.hStdInput = INVALID_HANDLE_VALUE;
+	si.dwFlags = STARTF_USESTDHANDLES;
+	printf_verbose("CreateProcess attempt\n");
+	fflush(stdout);
+	if (!CreateProcess(NULL, line, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+		die("precompile_helper: CreateProcess fail\n");
+	}
+	CloseHandle(h_wr);
+	printf_verbose("CreateProcess success\n");
+	HANDLE hlist[2];
+	hlist[0] = h_rd;
+	hlist[1] = pi.hProcess;
+	// listen for any compiler messages while we wait for it to finish
+	while (1) {
+		DWORD n = WaitForMultipleObjects(2, hlist, FALSE, INFINITE);
+		if (n == WAIT_OBJECT_0) {
+			// compiler printed something to stdout or stderr
+			char cbuf[16384];
+			DWORD len=0;
+			BOOL r = ReadFile(h_rd, cbuf, sizeof(cbuf), &len, NULL);
+			if (!r || len == 0) break;
+			char *src = cbuf;
+			char *dst = cbuf;
+			for (i=0; i < len; i++) {   // delete any '\r' chars, which
+				if (*src != '\r') { // cause double space in Arduino
+					*dst++ = *src++;
+				} else {
+					src++;
+				}
+			}
+			len = dst - cbuf;
+			if (len > 0) {
+				fwrite(cbuf, 1, len, stdout);
+				fflush(stdout);
+			}
+		} else if (n == WAIT_OBJECT_0 + 1) {
+			// compiled completed
+			break;
+		}
+	}
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+#else
+	arglist[argcount] = NULL;
 	execv(argv[first_compiler_arg], arglist);
+#endif
 	return 0;
 }
 
@@ -269,31 +358,57 @@ int parsedep(const char **ptr, char *name, int maxlen)
 int get_fileinfo(const char *filename, fileinfo_t *info)
 {
 	if (!filename || !info) return 0;
+#if defined(OS_WINDOWS)
+	if (!(GetFileAttributesEx(filename, GetFileExInfoStandard, &(info->s)))) return 0;
+#else
 	if (stat(filename, &(info->s)) != 0) return 0;
+#endif
 	return 1;
 }
 
 int is_dir(const fileinfo_t *info)
 {
 	if (!info) return 0;
+#if defined(OS_WINDOWS)
+	if (!(info->s.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return 0;
+	return 1;
+#else
 	return S_ISDIR(info->s.st_mode);
+#endif
 }
 
 int file_size(const fileinfo_t *info)
 {
 	if (!info) return 0;
+#if defined(OS_WINDOWS)
+	return info->s.nFileSizeLow;
+#else
 	return info->s.st_size;
+#endif
 }
 
 // return 1 if file1 is newer than file2, or 0 if they are equal or file1 is older
-int is_newer(const fileinfo_t * file1, const fileinfo_t *file2)
+int is_newer(const fileinfo_t *file1, const fileinfo_t *file2)
 {
-	//printf("file1: %ld.%09ld\n", file1->s.st_mtime, file1->s.st_mtim.tv_nsec);
-	//printf("file2: %ld.%09ld\n", file2->s.st_mtime, file2->s.st_mtim.tv_nsec);
-	if (file1->s.st_mtime > file2->s.st_mtime) return 1;
-	if (file1->s.st_mtime == file2->s.st_mtime) {
-		if (file1->s.st_mtim.tv_nsec > file2->s.st_mtim.tv_nsec) return 1;
+#if defined(OS_WINDOWS)
+	if (file1->s.ftLastWriteTime.dwHighDateTime > file2->s.ftLastWriteTime.dwHighDateTime ||
+	  (file1->s.ftLastWriteTime.dwHighDateTime == file2->s.ftLastWriteTime.dwHighDateTime &&
+	  file1->s.ftLastWriteTime.dwLowDateTime > file2->s.ftLastWriteTime.dwLowDateTime)) {
+		return 1;
 	}
+#elif defined(OS_MACOSX)
+	if (file1->s.st_mtimespec.tv_sec > file2->s.st_mtimespec.tv_sec ||
+	  (file1->s.st_mtimespec.tv_sec == file2->s.st_mtimespec.tv_sec &&
+	  file1->s.st_mtimespec.tv_nsec > file2->s.st_mtimespec.tv_nsec)) {
+		return 1;
+	}
+#elif defined(OS_LINUX32) || defined(OS_LINUX64) || defined(OS_LINUXARM)
+	if (file1->s.st_mtime > file2->s.st_mtime ||
+	  (file1->s.st_mtime == file2->s.st_mtime &&
+	  file1->s.st_mtim.tv_nsec > file2->s.st_mtim.tv_nsec)) {
+		return 1;
+	}
+#endif
 	return 0;
 }
 
@@ -301,7 +416,11 @@ int is_newer(const fileinfo_t * file1, const fileinfo_t *file2)
 
 int create_dir(const char *name)
 {
+#if defined(OS_WINDOWS)
+	if (_mkdir(name) == 0) return 1;
+#else
 	if (mkdir(name, 0777) == 0) return 1;
+#endif
 	return 0;
 }
 
@@ -387,7 +506,8 @@ void die(const char *format, ...)
 {
 	va_list args;
 	va_start(args, format);
-	vfprintf(stderr, format, args);
+	vfprintf(stdout, format, args);
 	va_end(args);
+	fflush(stdout);
 	exit(1);
 }
